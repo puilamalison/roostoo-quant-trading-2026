@@ -1,81 +1,72 @@
-import os
 import json
+import logging
 import math
 import time
-import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 
 from data.market_data import get_historical_ohlcv
 from execution.roostoo_client import RoostooClient
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-load_dotenv()
-
-# IMPORTANT:
-# Keep False until dry run is validated.
+# Keep False for the first TEST-account validation.
 LIVE_TRADING = False
 
 ASSETS = {
-    "BTC": {
-        "binance": "BTCUSDT",
-        "roostoo": "BTC/USD",
-    },
-    "ETH": {
-        "binance": "ETHUSDT",
-        "roostoo": "ETH/USD",
-    },
-    "SOL": {
-        "binance": "SOLUSDT",
-        "roostoo": "SOL/USD",
-    },
-    "BNB": {
-        "binance": "BNBUSDT",
-        "roostoo": "BNB/USD",
-    },
-    "XRP": {
-        "binance": "XRPUSDT",
-        "roostoo": "XRP/USD",
-    },
+    "BTC": {"binance": "BTCUSDT", "roostoo": "BTC/USD"},
+    "ETH": {"binance": "ETHUSDT", "roostoo": "ETH/USD"},
+    "SOL": {"binance": "SOLUSDT", "roostoo": "SOL/USD"},
+    "BNB": {"binance": "BNBUSDT", "roostoo": "BNB/USD"},
+    "XRP": {"binance": "XRPUSDT", "roostoo": "XRP/USD"},
 }
 
 HISTORY_DAYS = 230
 
-MOM_30_HOURS = 24 * 30
-MOM_90_HOURS = 24 * 90
-VOL_30_HOURS = 24 * 30
-MA_30_HOURS = 24 * 30
-BTC_200D_HOURS = 24 * 200
+MOM_30 = 24 * 30
+MOM_90 = 24 * 90
+VOL_30 = 24 * 30
+MA_30 = 24 * 30
+BTC_MA_200 = 24 * 200
 
 TOP_N = 2
 
-# 98.8% invested = 1.2% cash buffer.
+# 98.8% invested = 1.2% cash reserve.
 INVESTED_FRACTION = 0.988
-
-CORE_REBALANCE_DAYS = 7
-
-# Daily risk-layer trigger.
-DRIFT_THRESHOLD = 0.03
 
 MIN_TRADE_USD = 5.0
 
-# Prevent accidental repeated execution.
-MIN_HOURS_BETWEEN_EXECUTIONS = 20
+# Deterministic core schedule:
+# Monday 00:00 UTC.
+CORE_WEEKDAY = 0
+
+# Daily bot evaluation time:
+# 00:15 UTC.
+DAILY_RUN_HOUR = 0
+DAILY_RUN_MINUTE = 15
+
+# Risk exits can occur outside the weekly rebalance.
+#
+# If BTC regime changes from risk-on to risk-off,
+# liquidate the strategy portfolio.
+#
+# This is a genuine risk-control action rather than
+# target chasing.
+ENABLE_REGIME_EXIT = True
 
 STATE_DIR = Path("state")
 LOG_DIR = Path("logs")
 
-STATE_FILE = STATE_DIR / "bot_state.json"
-TRADE_LOG = LOG_DIR / "trades.csv"
-BOT_LOG = LOG_DIR / "bot.log"
+STATE_FILE = STATE_DIR / "production_state.json"
+TRADE_LOG = LOG_DIR / "production_trades.csv"
+DECISION_LOG = LOG_DIR / "production_decisions.csv"
+BOT_LOG = LOG_DIR / "production_bot.log"
 
 
 # ============================================================
@@ -84,18 +75,11 @@ BOT_LOG = LOG_DIR / "bot.log"
 
 def setup_logging():
 
-    LOG_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
+        format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
             logging.FileHandler(BOT_LOG),
             logging.StreamHandler(),
@@ -107,45 +91,58 @@ def setup_logging():
 # STATE
 # ============================================================
 
+def default_state():
+
+    return {
+        "last_daily_cycle": None,
+        "last_core_week": None,
+        "last_regime": None,
+    }
+
+
 def load_state():
 
-    STATE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     if not STATE_FILE.exists():
+        return default_state()
 
-        return {
-            "last_execution_time": None,
-            "last_core_rebalance": None,
-        }
+    try:
 
-    with open(
-        STATE_FILE,
-        "r"
-    ) as f:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
 
-        return json.load(f)
+        for key, value in default_state().items():
+
+            if key not in state:
+                state[key] = value
+
+        return state
+
+    except Exception:
+
+        logging.exception(
+            "Could not read state file."
+        )
+
+        raise
 
 
 def save_state(state):
 
-    STATE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(
-        STATE_FILE,
-        "w"
-    ) as f:
+    temporary = STATE_FILE.with_suffix(".tmp")
+
+    with open(temporary, "w") as f:
 
         json.dump(
             state,
             f,
             indent=2
         )
+
+    temporary.replace(STATE_FILE)
 
 
 # ============================================================
@@ -166,20 +163,22 @@ def load_market_data():
         df = get_historical_ohlcv(
             symbol=info["binance"],
             interval="1h",
-            days=HISTORY_DAYS
+            days=HISTORY_DAYS,
         )
 
-        # Remove potentially incomplete candle.
-        if len(df) > 1:
-            df = df.iloc[:-1].copy()
+        if len(df) < 2:
 
-        df = df.set_index(
-            "open_time"
-        )
+            raise RuntimeError(
+                f"Insufficient data for {asset}."
+            )
 
-        prices[asset] = (
-            df["close"]
-        )
+        # The final Binance candle may still be open.
+        # Never generate signals from an incomplete candle.
+        df = df.iloc[:-1].copy()
+
+        df = df.set_index("open_time")
+
+        prices[asset] = df["close"]
 
     prices = (
         prices
@@ -187,62 +186,48 @@ def load_market_data():
         .sort_index()
     )
 
-    if len(prices) < BTC_200D_HOURS:
+    if len(prices) < BTC_MA_200:
 
         raise RuntimeError(
-            "Insufficient historical data."
+            "Insufficient aligned market history."
         )
+
+    logging.info(
+        "Latest closed signal candle: %s",
+        prices.index[-1],
+    )
 
     return prices
 
 
 # ============================================================
-# FROZEN V1 STRATEGY
+# FROZEN V1 ALPHA STRATEGY
 # ============================================================
 
 def calculate_target(prices):
 
-    returns = (
-        prices.pct_change()
-    )
+    returns = prices.pct_change()
 
-    mom_30 = (
-        prices.pct_change(
-            MOM_30_HOURS
-        )
-    )
-
-    mom_90 = (
-        prices.pct_change(
-            MOM_90_HOURS
-        )
-    )
+    mom_30 = prices.pct_change(MOM_30)
+    mom_90 = prices.pct_change(MOM_90)
 
     vol_30 = (
         returns
-        .rolling(
-            VOL_30_HOURS
-        )
+        .rolling(VOL_30)
         .std()
         *
-        np.sqrt(
-            24 * 365
-        )
+        np.sqrt(24 * 365)
     )
 
     ma_30 = (
         prices
-        .rolling(
-            MA_30_HOURS
-        )
+        .rolling(MA_30)
         .mean()
     )
 
-    btc_200 = (
+    btc_ma = (
         prices["BTC"]
-        .rolling(
-            BTC_200D_HOURS
-        )
+        .rolling(BTC_MA_200)
         .mean()
     )
 
@@ -250,49 +235,33 @@ def calculate_target(prices):
         prices["BTC"].iloc[-1]
     )
 
-    btc_ma = float(
-        btc_200.iloc[-1]
+    btc_200 = float(
+        btc_ma.iloc[-1]
     )
 
     target = pd.Series(
         0.0,
-        index=prices.columns
+        index=prices.columns,
     )
 
-    # --------------------------------------------------------
-    # BTC REGIME FILTER
-    # --------------------------------------------------------
-
-    risk_on = (
-        btc_price > btc_ma
-    )
+    risk_on = btc_price > btc_200
 
     if not risk_on:
 
         return {
             "risk_on": False,
             "btc_price": btc_price,
-            "btc_ma": btc_ma,
+            "btc_ma": btc_200,
             "weights": target,
         }
 
-    # --------------------------------------------------------
-    # MOMENTUM SCORE
-    # --------------------------------------------------------
-
     score = (
-        0.3
-        *
-        mom_30.iloc[-1]
+        0.3 * mom_30.iloc[-1]
         +
-        0.7
-        *
-        mom_90.iloc[-1]
+        0.7 * mom_90.iloc[-1]
     )
 
-    current_vol = (
-        vol_30.iloc[-1]
-    )
+    current_vol = vol_30.iloc[-1]
 
     trend = (
         prices.iloc[-1]
@@ -346,9 +315,160 @@ def calculate_target(prices):
     return {
         "risk_on": True,
         "btc_price": btc_price,
-        "btc_ma": btc_ma,
+        "btc_ma": btc_200,
         "weights": target,
     }
+
+
+# ============================================================
+# API RETRY WRAPPER
+# ============================================================
+
+def api_call(
+    function,
+    *args,
+    attempts=3,
+    **kwargs,
+):
+
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+
+        try:
+
+            return function(
+                *args,
+                **kwargs,
+            )
+
+        except Exception as error:
+
+            last_error = error
+
+            logging.warning(
+                "API attempt %d/%d failed: %s",
+                attempt,
+                attempts,
+                error,
+            )
+
+            if attempt < attempts:
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(
+        f"API call failed after "
+        f"{attempts} attempts: "
+        f"{last_error}"
+    )
+
+
+# ============================================================
+# TICKER EXTRACTION
+# ============================================================
+
+def extract_ticker_price(
+    response,
+    pair,
+):
+
+    if not isinstance(response, dict):
+
+        raise RuntimeError(
+            f"Unexpected ticker response "
+            f"for {pair}: {response}"
+        )
+
+    if pair in response:
+
+        ticker = response[pair]
+
+        if (
+            isinstance(ticker, dict)
+            and
+            "LastPrice" in ticker
+        ):
+
+            return float(
+                ticker["LastPrice"]
+            )
+
+    if "LastPrice" in response:
+
+        return float(
+            response["LastPrice"]
+        )
+
+    data = response.get("Data")
+
+    if isinstance(data, dict):
+
+        if pair in data:
+
+            ticker = data[pair]
+
+            if (
+                isinstance(ticker, dict)
+                and
+                "LastPrice" in ticker
+            ):
+
+                return float(
+                    ticker["LastPrice"]
+                )
+
+        if "LastPrice" in data:
+
+            return float(
+                data["LastPrice"]
+            )
+
+    raise RuntimeError(
+        f"Could not extract {pair} price. "
+        f"Response: {response}"
+    )
+
+
+# ============================================================
+# ROOSTOO PRICES
+# ============================================================
+
+def get_roostoo_prices(client):
+
+    prices = {}
+
+    for asset, info in ASSETS.items():
+
+        pair = info["roostoo"]
+
+        response = api_call(
+            client.get_ticker,
+            pair,
+        )
+
+        price = extract_ticker_price(
+            response,
+            pair,
+        )
+
+        if not math.isfinite(price) or price <= 0:
+
+            raise RuntimeError(
+                f"Invalid price for {pair}: "
+                f"{price}"
+            )
+
+        prices[asset] = price
+
+        logging.info(
+            "Roostoo %-3s: %.8f",
+            asset,
+            price,
+        )
+
+        time.sleep(0.15)
+
+    return prices
 
 
 # ============================================================
@@ -357,8 +477,8 @@ def calculate_target(prices):
 
 def get_exchange_rules(client):
 
-    response = (
-        client.get_exchange_info()
+    response = api_call(
+        client.get_exchange_info
     )
 
     if "TradePairs" not in response:
@@ -377,7 +497,8 @@ def get_exchange_rules(client):
         if pair not in response["TradePairs"]:
 
             raise RuntimeError(
-                f"{pair} missing from exchangeInfo."
+                f"{pair} missing from "
+                f"exchangeInfo."
             )
 
         pair_info = (
@@ -385,209 +506,37 @@ def get_exchange_rules(client):
         )
 
         rules[asset] = {
-            "amount_precision":
-                int(
-                    pair_info[
-                        "AmountPrecision"
-                    ]
-                ),
-
-            "minimum_order":
-                float(
-                    pair_info[
-                        "MiniOrder"
-                    ]
-                ),
+            "amount_precision": int(
+                pair_info[
+                    "AmountPrecision"
+                ]
+            ),
+            "minimum_order": float(
+                pair_info[
+                    "MiniOrder"
+                ]
+            ),
         }
 
     return rules
 
 
 # ============================================================
-# ROOSTOO PRICE EXTRACTION
-# ============================================================
-
-def extract_ticker_price(
-    response,
-    pair
-):
-
-    """
-    Safely extract LastPrice from different
-    Roostoo ticker response structures.
-    """
-
-    if not isinstance(
-        response,
-        dict
-    ):
-
-        raise RuntimeError(
-            f"Unexpected ticker response "
-            f"for {pair}: {response}"
-        )
-
-    # --------------------------------------------------------
-    # STRUCTURE 1
-    #
-    # {
-    #   "Success": True,
-    #   "BTC/USD": {
-    #       "LastPrice": 86000
-    #   }
-    # }
-    # --------------------------------------------------------
-
-    if pair in response:
-
-        ticker = response[pair]
-
-        if (
-            isinstance(
-                ticker,
-                dict
-            )
-            and
-            "LastPrice" in ticker
-        ):
-
-            return float(
-                ticker["LastPrice"]
-            )
-
-    # --------------------------------------------------------
-    # STRUCTURE 2
-    #
-    # {
-    #   "LastPrice": 86000
-    # }
-    # --------------------------------------------------------
-
-    if "LastPrice" in response:
-
-        return float(
-            response["LastPrice"]
-        )
-
-    # --------------------------------------------------------
-    # STRUCTURE 3
-    #
-    # {
-    #   "Data": {
-    #       "BTC/USD": {
-    #           "LastPrice": ...
-    #       }
-    #   }
-    # }
-    # --------------------------------------------------------
-
-    data = response.get(
-        "Data"
-    )
-
-    if isinstance(
-        data,
-        dict
-    ):
-
-        if pair in data:
-
-            ticker = data[pair]
-
-            if (
-                isinstance(
-                    ticker,
-                    dict
-                )
-                and
-                "LastPrice" in ticker
-            ):
-
-                return float(
-                    ticker[
-                        "LastPrice"
-                    ]
-                )
-
-        if "LastPrice" in data:
-
-            return float(
-                data["LastPrice"]
-            )
-
-    # --------------------------------------------------------
-    # UNKNOWN STRUCTURE
-    # --------------------------------------------------------
-
-    raise RuntimeError(
-        f"Could not extract price for {pair}. "
-        f"Full response: {response}"
-    )
-
-
-# ============================================================
-# ROOSTOO PRICES
-# ============================================================
-
-def get_roostoo_prices(client):
-
-    prices = {}
-
-    for asset, info in ASSETS.items():
-
-        pair = (
-            info["roostoo"]
-        )
-
-        response = (
-            client.get_ticker(
-                pair
-            )
-        )
-
-        price = (
-            extract_ticker_price(
-                response,
-                pair
-            )
-        )
-
-        if price <= 0:
-
-            raise RuntimeError(
-                f"Invalid {pair} price: "
-                f"{price}"
-            )
-
-        prices[asset] = price
-
-        logging.info(
-            "Roostoo %s price: %.8f",
-            asset,
-            price
-        )
-
-        time.sleep(0.1)
-
-    return prices
-
-
-# ============================================================
-# CURRENT PORTFOLIO
+# PORTFOLIO
 # ============================================================
 
 def get_portfolio(
     client,
-    market_prices
+    market_prices,
 ):
 
-    response = (
-        client.get_balance()
+    response = api_call(
+        client.get_balance
     )
 
     if not response.get(
         "Success",
-        False
+        False,
     ):
 
         raise RuntimeError(
@@ -595,9 +544,7 @@ def get_portfolio(
             + str(response)
         )
 
-    wallet = (
-        response["SpotWallet"]
-    )
+    wallet = response["SpotWallet"]
 
     usd = float(
         wallet
@@ -608,7 +555,7 @@ def get_portfolio(
     quantities = {}
     asset_values = {}
 
-    total_value = usd
+    total = usd
 
     for asset in ASSETS:
 
@@ -624,26 +571,21 @@ def get_portfolio(
             market_prices[asset]
         )
 
-        quantities[asset] = (
-            quantity
-        )
+        quantities[asset] = quantity
+        asset_values[asset] = value
 
-        asset_values[asset] = (
-            value
-        )
-
-        total_value += value
+        total += value
 
     weights = {}
 
     for asset in ASSETS:
 
-        if total_value > 0:
+        if total > 0:
 
             weights[asset] = (
                 asset_values[asset]
                 /
-                total_value
+                total
             )
 
         else:
@@ -655,160 +597,20 @@ def get_portfolio(
         "quantities": quantities,
         "asset_values": asset_values,
         "weights": weights,
-        "total_value": total_value,
+        "total_value": total,
     }
 
 
 # ============================================================
-# STRATEGY REBALANCE DECISION
-# ============================================================
-
-def should_rebalance(
-    target_weights,
-    portfolio,
-    state
-):
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    last_core = (
-        state.get(
-            "last_core_rebalance"
-        )
-    )
-
-    # First execution.
-    if last_core is None:
-
-        return (
-            True,
-            "INITIAL_CORE_REBALANCE"
-        )
-
-    last_core_dt = (
-        datetime.fromisoformat(
-            last_core
-        )
-    )
-
-    elapsed = (
-        now
-        -
-        last_core_dt
-    )
-
-    # Weekly alpha rebalance.
-    if elapsed.total_seconds() >= (
-        CORE_REBALANCE_DAYS
-        *
-        24
-        *
-        3600
-    ):
-
-        return (
-            True,
-            "WEEKLY_CORE_REBALANCE"
-        )
-
-    # --------------------------------------------------------
-    # DAILY RISK LAYER
-    # --------------------------------------------------------
-
-    maximum_drift = 0.0
-
-    for asset in ASSETS:
-
-        actual = (
-            portfolio[
-                "weights"
-            ][asset]
-        )
-
-        target = float(
-            target_weights[
-                asset
-            ]
-        )
-
-        drift = abs(
-            actual
-            -
-            target
-        )
-
-        maximum_drift = max(
-            maximum_drift,
-            drift
-        )
-
-    if maximum_drift >= (
-        DRIFT_THRESHOLD
-    ):
-
-        return (
-            True,
-            f"RISK_DRIFT_{maximum_drift:.4f}"
-        )
-
-    return (
-        False,
-        f"NO_REBALANCE_MAX_DRIFT_"
-        f"{maximum_drift:.4f}"
-    )
-
-
-# ============================================================
-# EXECUTION COOLDOWN
-# ============================================================
-
-def cooldown_ok(state):
-
-    last_execution = (
-        state.get(
-            "last_execution_time"
-        )
-    )
-
-    if last_execution is None:
-
-        return True
-
-    last_dt = (
-        datetime.fromisoformat(
-            last_execution
-        )
-    )
-
-    elapsed_hours = (
-        datetime.now(
-            timezone.utc
-        )
-        -
-        last_dt
-    ).total_seconds() / 3600
-
-    return (
-        elapsed_hours
-        >=
-        MIN_HOURS_BETWEEN_EXECUTIONS
-    )
-
-
-# ============================================================
-# ROUND QUANTITY DOWN
+# QUANTITY ROUNDING
 # ============================================================
 
 def round_down(
     value,
-    precision
+    precision,
 ):
 
-    multiplier = (
-        10 ** precision
-    )
+    multiplier = 10 ** precision
 
     return (
         math.floor(
@@ -824,32 +626,26 @@ def round_down(
 
 
 # ============================================================
-# BUILD ORDER PLAN
+# ORDER PLAN
 # ============================================================
 
 def build_orders(
-    target_weights,
+    target,
     portfolio,
-    market_prices,
-    rules
+    prices,
+    rules,
 ):
 
-    total_value = (
-        portfolio[
-            "total_value"
-        ]
-    )
+    total = portfolio["total_value"]
 
     orders = []
 
     for asset, info in ASSETS.items():
 
         target_value = (
-            total_value
+            total
             *
-            float(
-                target_weights[asset]
-            )
+            float(target[asset])
         )
 
         current_value = (
@@ -866,62 +662,52 @@ def build_orders(
 
         minimum = max(
             MIN_TRADE_USD,
-            rules[
-                asset
-            ][
+            rules[asset][
                 "minimum_order"
-            ]
+            ],
         )
 
-        if abs(
-            difference
-        ) < minimum:
-
+        if abs(difference) < minimum:
             continue
 
-        if difference > 0:
-
-            side = "BUY"
-
-        else:
-
-            side = "SELL"
+        side = (
+            "BUY"
+            if difference > 0
+            else "SELL"
+        )
 
         quantity = (
             abs(difference)
             /
-            market_prices[asset]
+            prices[asset]
         )
 
-        # Never sell more than we own.
         if side == "SELL":
 
             quantity = min(
                 quantity,
                 portfolio[
                     "quantities"
-                ][asset]
+                ][asset],
             )
 
         quantity = round_down(
             quantity,
-            rules[
-                asset
-            ][
+            rules[asset][
                 "amount_precision"
-            ]
+            ],
         )
 
-        estimated_value = (
+        value = (
             quantity
             *
-            market_prices[asset]
+            prices[asset]
         )
 
         if quantity <= 0:
             continue
 
-        if estimated_value < minimum:
+        if value < minimum:
             continue
 
         orders.append({
@@ -929,11 +715,9 @@ def build_orders(
             "pair": info["roostoo"],
             "side": side,
             "quantity": quantity,
-            "estimated_value":
-                estimated_value,
+            "estimated_value": value,
         })
 
-    # SELL before BUY.
     orders.sort(
         key=lambda order:
         0
@@ -945,18 +729,86 @@ def build_orders(
 
 
 # ============================================================
+# DECISION LOG
+# ============================================================
+
+def log_decision(
+    reason,
+    signal,
+    portfolio,
+    orders,
+):
+
+    LOG_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    row = {
+        "timestamp":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "reason":
+            reason,
+
+        "risk_on":
+            signal["risk_on"],
+
+        "btc_price":
+            signal["btc_price"],
+
+        "btc_200d_ma":
+            signal["btc_ma"],
+
+        "portfolio_value":
+            portfolio["total_value"],
+
+        "cash":
+            portfolio["usd"],
+
+        "target_weights":
+            json.dumps(
+                signal[
+                    "weights"
+                ].to_dict()
+            ),
+
+        "current_weights":
+            json.dumps(
+                portfolio["weights"]
+            ),
+
+        "planned_orders":
+            json.dumps(orders),
+    }
+
+    pd.DataFrame(
+        [row]
+    ).to_csv(
+        DECISION_LOG,
+        mode="a",
+        header=(
+            not DECISION_LOG.exists()
+        ),
+        index=False,
+    )
+
+
+# ============================================================
 # TRADE LOG
 # ============================================================
 
 def log_trade(
     reason,
     order,
-    response
+    response,
 ):
 
     LOG_DIR.mkdir(
         parents=True,
-        exist_ok=True
+        exist_ok=True,
     )
 
     row = {
@@ -985,50 +837,199 @@ def log_trade(
         "success":
             response.get(
                 "Success",
-                False
+                False,
             ),
 
         "response":
-            json.dumps(
-                response
-            ),
+            json.dumps(response),
     }
 
-    df = pd.DataFrame(
+    pd.DataFrame(
         [row]
-    )
-
-    df.to_csv(
+    ).to_csv(
         TRADE_LOG,
         mode="a",
         header=(
             not TRADE_LOG.exists()
         ),
-        index=False
+        index=False,
     )
 
 
 # ============================================================
-# EXECUTE
+# SCHEDULE
 # ============================================================
 
-def execute_orders(
-    client,
-    orders,
-    reason
+def current_week_id(now):
+
+    iso = now.isocalendar()
+
+    return (
+        f"{iso.year}-W"
+        f"{iso.week:02d}"
+    )
+
+
+def determine_action(
+    signal,
+    state,
+    now,
 ):
+
+    today = now.date().isoformat()
+
+    if state.get(
+        "last_daily_cycle"
+    ) == today:
+
+        return (
+            False,
+            "ALREADY_CHECKED_TODAY",
+        )
+
+    current_regime = (
+        "RISK_ON"
+        if signal["risk_on"]
+        else
+        "RISK_OFF"
+    )
+
+    previous_regime = (
+        state.get(
+            "last_regime"
+        )
+    )
+
+    # Immediate defensive liquidation if
+    # regime changes from ON -> OFF.
+    if (
+        ENABLE_REGIME_EXIT
+        and
+        previous_regime == "RISK_ON"
+        and
+        current_regime == "RISK_OFF"
+    ):
+
+        return (
+            True,
+            "REGIME_EXIT",
+        )
+
+    week_id = current_week_id(now)
+
+    # Core portfolio is intentionally only
+    # rebalanced once per week.
+    if (
+        now.weekday() == CORE_WEEKDAY
+        and
+        state.get(
+            "last_core_week"
+        ) != week_id
+    ):
+
+        return (
+            True,
+            "WEEKLY_CORE_REBALANCE",
+        )
+
+    return (
+        False,
+        "DAILY_RISK_CHECK_ONLY",
+    )
+
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+
+def execute_single_order(
+    client,
+    order,
+    reason,
+):
+
+    response = api_call(
+        client.place_order,
+        pair=order["pair"],
+        side=order["side"],
+        quantity=order["quantity"],
+        order_type="MARKET",
+    )
+
+    log_trade(
+        reason,
+        order,
+        response,
+    )
+
+    if not response.get(
+        "Success",
+        False,
+    ):
+
+        raise RuntimeError(
+            f"Order failed: {response}"
+        )
+
+    logging.info(
+        "FILLED/SUBMITTED %s %s %.8f",
+        order["side"],
+        order["pair"],
+        order["quantity"],
+    )
+
+    return response
+
+
+def execute_rebalance(
+    client,
+    target,
+    reason,
+):
+
+    prices = get_roostoo_prices(
+        client
+    )
+
+    portfolio = get_portfolio(
+        client,
+        prices,
+    )
+
+    rules = get_exchange_rules(
+        client
+    )
+
+    orders = build_orders(
+        target,
+        portfolio,
+        prices,
+        rules,
+    )
 
     if not orders:
 
         logging.info(
-            "No executable orders."
+            "No executable trades required."
         )
 
         return False
 
     # --------------------------------------------------------
-    # DRY RUN
+    # SELL PHASE
     # --------------------------------------------------------
+
+    sells = [
+        order
+        for order in orders
+        if order["side"] == "SELL"
+    ]
+
+    buys = [
+        order
+        for order in orders
+        if order["side"] == "BUY"
+    ]
 
     if not LIVE_TRADING:
 
@@ -1039,368 +1040,361 @@ def execute_orders(
         for order in orders:
 
             logging.info(
-                "PLAN %s %s "
-                "%.8f ~$%.2f",
+                "PLAN %s %s %.8f ~$%.2f",
                 order["side"],
                 order["pair"],
                 order["quantity"],
-                order[
-                    "estimated_value"
-                ]
+                order["estimated_value"],
             )
 
         return False
 
-    # --------------------------------------------------------
-    # LIVE EXECUTION
-    # --------------------------------------------------------
+    executed = False
 
-    executed_any = False
+    for order in sells:
 
-    for order in orders:
-
-        # Refresh available USD before
-        # every BUY.
-        if order["side"] == "BUY":
-
-            balance = (
-                client.get_balance()
-            )
-
-            available_usd = float(
-                balance[
-                    "SpotWallet"
-                ][
-                    "USD"
-                ][
-                    "Free"
-                ]
-            )
-
-            # 0.1% taker fee plus
-            # extra execution cushion.
-            required_usd = (
-                order[
-                    "estimated_value"
-                ]
-                *
-                1.002
-            )
-
-            if required_usd > available_usd:
-
-                logging.warning(
-                    "Skipping %s: "
-                    "requires $%.2f, "
-                    "available $%.2f",
-                    order["pair"],
-                    required_usd,
-                    available_usd
-                )
-
-                continue
-
-        logging.info(
-            "EXECUTING %s %s %.8f",
-            order["side"],
-            order["pair"],
-            order["quantity"]
-        )
-
-        response = (
-            client.place_order(
-                pair=order["pair"],
-                side=order["side"],
-                quantity=order[
-                    "quantity"
-                ],
-                order_type="MARKET"
-            )
-        )
-
-        log_trade(
-            reason,
+        execute_single_order(
+            client,
             order,
-            response
+            reason,
         )
 
-        if response.get(
-            "Success",
-            False
-        ):
-
-            executed_any = True
-
-            logging.info(
-                "Order successful."
-            )
-
-        else:
-
-            logging.error(
-                "Order failed: %s",
-                response
-            )
+        executed = True
 
         time.sleep(1)
 
-    return executed_any
+    # --------------------------------------------------------
+    # REFRESH AFTER SELLS
+    # --------------------------------------------------------
+
+    if sells:
+
+        prices = get_roostoo_prices(
+            client
+        )
+
+        portfolio = get_portfolio(
+            client,
+            prices,
+        )
+
+        orders = build_orders(
+            target,
+            portfolio,
+            prices,
+            rules,
+        )
+
+        buys = [
+            order
+            for order in orders
+            if order["side"] == "BUY"
+        ]
+
+    # --------------------------------------------------------
+    # BUY PHASE
+    # --------------------------------------------------------
+
+    for order in buys:
+
+        balance = api_call(
+            client.get_balance
+        )
+
+        available_usd = float(
+            balance[
+                "SpotWallet"
+            ][
+                "USD"
+            ][
+                "Free"
+            ]
+        )
+
+        # 0.1% taker fee + extra cushion.
+        required = (
+            order[
+                "estimated_value"
+            ]
+            *
+            1.002
+        )
+
+        if required > available_usd:
+
+            logging.warning(
+                "Skipping %s: "
+                "requires $%.2f, "
+                "available $%.2f",
+                order["pair"],
+                required,
+                available_usd,
+            )
+
+            continue
+
+        execute_single_order(
+            client,
+            order,
+            reason,
+        )
+
+        executed = True
+
+        time.sleep(1)
+
+    return executed
 
 
 # ============================================================
-# MAIN CYCLE
+# ONE AUTONOMOUS DAILY CYCLE
 # ============================================================
 
-def run():
+def run_cycle():
 
-    setup_logging()
+    client = RoostooClient()
 
-    logging.info(
-        "=" * 60
+    state = load_state()
+
+    now = datetime.now(
+        timezone.utc
     )
 
     logging.info(
-        "ROOSTOO PRODUCTION BOT START"
+        "=" * 65
+    )
+
+    logging.info(
+        "BOT CYCLE | %s",
+        now.isoformat(),
     )
 
     logging.info(
         "LIVE_TRADING=%s",
-        LIVE_TRADING
+        LIVE_TRADING,
     )
 
-    client = (
-        RoostooClient()
+    prices = load_market_data()
+
+    signal = calculate_target(
+        prices
     )
 
-    state = (
-        load_state()
-    )
+    target = signal["weights"]
 
-    # --------------------------------------------------------
-    # STRATEGY
-    # --------------------------------------------------------
-
-    prices = (
-        load_market_data()
-    )
-
-    signal = (
-        calculate_target(
-            prices
-        )
-    )
-
-    target = (
-        signal["weights"]
+    logging.info(
+        "BTC: %.2f | 200d MA: %.2f",
+        signal["btc_price"],
+        signal["btc_ma"],
     )
 
     logging.info(
-        "BTC price: %.2f",
-        signal["btc_price"]
-    )
-
-    logging.info(
-        "BTC 200d MA: %.2f",
-        signal["btc_ma"]
-    )
-
-    logging.info(
-        "Regime: %s",
+        "REGIME: %s",
         (
             "RISK-ON"
             if signal["risk_on"]
             else
             "RISK-OFF"
-        )
+        ),
     )
 
     for asset in ASSETS:
 
         logging.info(
-            "Target %-3s: %.2f%%",
+            "TARGET %-3s %.2f%%",
             asset,
-            target[asset] * 100
+            target[asset] * 100,
         )
 
-    target_cash = (
-        1
-        -
-        target.sum()
-    )
-
     logging.info(
-        "Target cash: %.2f%%",
-        target_cash * 100
+        "TARGET CASH %.2f%%",
+        (
+            1
+            -
+            target.sum()
+        )
+        *
+        100,
     )
 
-    # --------------------------------------------------------
-    # ROOSTOO MARKET
-    # --------------------------------------------------------
-
-    market_prices = (
+    roostoo_prices = (
         get_roostoo_prices(
             client
         )
     )
 
-    portfolio = (
-        get_portfolio(
-            client,
-            market_prices
-        )
+    portfolio = get_portfolio(
+        client,
+        roostoo_prices,
     )
 
     logging.info(
-        "Portfolio value: $%.2f",
-        portfolio[
-            "total_value"
-        ]
-    )
-
-    logging.info(
-        "USD cash: $%.2f",
-        portfolio["usd"]
+        "PORTFOLIO $%.2f | CASH $%.2f",
+        portfolio["total_value"],
+        portfolio["usd"],
     )
 
     for asset in ASSETS:
 
         logging.info(
-            "Current %-3s: %.2f%%",
+            "CURRENT %-3s %.2f%%",
             asset,
             portfolio[
                 "weights"
             ][asset]
             *
-            100
+            100,
         )
 
-    # --------------------------------------------------------
-    # REBALANCE DECISION
-    # --------------------------------------------------------
-
-    rebalance, reason = (
-        should_rebalance(
-            target,
-            portfolio,
-            state
+    should_trade, reason = (
+        determine_action(
+            signal,
+            state,
+            now,
         )
     )
 
     logging.info(
-        "Decision: %s",
-        reason
+        "DECISION: %s",
+        reason,
     )
 
-    if not rebalance:
-
-        logging.info(
-            "No strategy-driven "
-            "rebalance required."
-        )
-
-        return
-
-    if not cooldown_ok(
-        state
-    ):
-
-        logging.info(
-            "Execution cooldown active."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ORDER PLAN
-    # --------------------------------------------------------
-
-    rules = (
-        get_exchange_rules(
-            client
-        )
+    rules = get_exchange_rules(
+        client
     )
 
-    orders = (
-        build_orders(
-            target,
-            portfolio,
-            market_prices,
-            rules
-        )
+    planned_orders = build_orders(
+        target,
+        portfolio,
+        roostoo_prices,
+        rules,
     )
 
-    if not orders:
-
-        logging.info(
-            "No executable portfolio "
-            "adjustments required."
-        )
-
-        return
-
-    logging.info(
-        "Execution reason: %s",
-        reason
+    log_decision(
+        reason,
+        signal,
+        portfolio,
+        planned_orders,
     )
 
-    for order in orders:
+    if should_trade:
 
-        logging.info(
-            "PLAN %s %s "
-            "%.8f ~$%.2f",
-            order["side"],
-            order["pair"],
-            order["quantity"],
-            order[
-                "estimated_value"
-            ]
-        )
-
-    # --------------------------------------------------------
-    # EXECUTION
-    # --------------------------------------------------------
-
-    executed = (
-        execute_orders(
+        execute_rebalance(
             client,
-            orders,
-            reason
+            target,
+            reason,
         )
-    )
 
-    # Only modify state after REAL execution.
-    if executed:
+        if (
+            reason
+            ==
+            "WEEKLY_CORE_REBALANCE"
+            and
+            LIVE_TRADING
+        ):
 
-        now = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+            state[
+                "last_core_week"
+            ] = current_week_id(
+                now
+            )
+
+    # Mark daily cycle only in live autonomous mode.
+    # Dry-run testing therefore does not contaminate
+    # production state.
+    if LIVE_TRADING:
+
+        state[
+            "last_daily_cycle"
+        ] = (
+            now.date()
+            .isoformat()
         )
 
         state[
-            "last_execution_time"
-        ] = now
-
-        if reason in {
-            "INITIAL_CORE_REBALANCE",
-            "WEEKLY_CORE_REBALANCE",
-        }:
-
-            state[
-                "last_core_rebalance"
-            ] = now
-
-        save_state(
-            state
+            "last_regime"
+        ] = (
+            "RISK_ON"
+            if signal["risk_on"]
+            else
+            "RISK_OFF"
         )
 
-        logging.info(
-            "Execution state saved."
-        )
+        save_state(state)
 
     logging.info(
-        "BOT CYCLE COMPLETE"
+        "CYCLE COMPLETE"
     )
+
+
+# ============================================================
+# AUTONOMOUS LOOP
+# ============================================================
+
+def run_forever():
+
+    logging.info(
+        "Autonomous bot started."
+    )
+
+    logging.info(
+        "Scheduled daily evaluation: "
+        "%02d:%02d UTC",
+        DAILY_RUN_HOUR,
+        DAILY_RUN_MINUTE,
+    )
+
+    last_attempt_date = None
+
+    while True:
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        today = (
+            now.date()
+            .isoformat()
+        )
+
+        scheduled_time_reached = (
+            now.hour > DAILY_RUN_HOUR
+            or
+            (
+                now.hour
+                ==
+                DAILY_RUN_HOUR
+                and
+                now.minute
+                >=
+                DAILY_RUN_MINUTE
+            )
+        )
+
+        if (
+            scheduled_time_reached
+            and
+            last_attempt_date
+            !=
+            today
+        ):
+
+            try:
+
+                run_cycle()
+
+                last_attempt_date = today
+
+            except Exception:
+
+                logging.exception(
+                    "Daily cycle failed."
+                )
+
+                # Do not mark today complete.
+                # Retry after the sleep period.
+
+        time.sleep(60)
 
 
 # ============================================================
@@ -1409,14 +1403,30 @@ def run():
 
 if __name__ == "__main__":
 
+    setup_logging()
+
     try:
 
-        run()
+        if LIVE_TRADING:
+
+            run_forever()
+
+        else:
+
+            # Dry-run mode executes exactly one
+            # diagnostic cycle and exits.
+            run_cycle()
+
+    except KeyboardInterrupt:
+
+        logging.info(
+            "Bot stopped."
+        )
 
     except Exception:
 
         logging.exception(
-            "BOT CYCLE FAILED"
+            "BOT FAILED"
         )
 
         raise
