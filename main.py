@@ -18,7 +18,7 @@ from execution.roostoo_client import RoostooClient
 
 # IMPORTANT:
 # Keep False until the final competition-account dry run passes.
-LIVE_TRADING = False
+LIVE_TRADING = True
 
 ASSETS = {
     "BTC": {"binance": "BTCUSDT", "roostoo": "BTC/USD"},
